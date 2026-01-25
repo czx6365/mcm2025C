@@ -1,0 +1,13 @@
+{
+  "expected_first_medal_countries": 9.3008,
+  "mode_first_medal_countries": 9,
+  "P_first_medal_countries_equals_mode": 0.1402,
+  "PI_80": [
+    6,
+    13
+  ],
+  "PI_95": [
+    4,
+    15
+  ]
+}
