@@ -1,76 +1,71 @@
 # -*- coding: utf-8 -*-
 """
-MCM/ICM 2025 Problem C - Olympic Medal Prediction & Analysis
+MCM/ICM 2025 Problem C - Olympic Medal Table Model
+只使用题目给的五个数据文件：
+- data_dictionary.csv
+- summerOly_athletes.csv
+- summerOly_medal_counts.csv（本脚本不依赖它来训练；可用于对照核验）
+- summerOly_hosts.csv
+- summerOly_programs.csv
 
-Advanced modeling for Olympic medal counts with:
-- Negative Binomial Regression for count data
-- Comprehensive uncertainty quantification (prediction intervals)
-- Model diagnostics and performance evaluation
-- Coach effect detection via structural break analysis
-- 2028 Los Angeles Olympic projections
-- First-medal country probability estimation
+核心思路：
+1) 用 athletes 直接聚合得到每个 NOC-Year 的 Gold / Total（含 0 medal）
+2) 构造特征：上一届/历史 EMA、运动员规模、参赛运动数、主场、项目结构(按 sport)
+3) 分别拟合 Total 与 Gold 的负二项回归（NB2）
+4) 用参数协方差 + NB 计数噪声模拟 -> 预测区间
+5) Time-based CV 评估误差与区间覆盖率
+6) 预测 LA 2028 medal table；统计首次获牌国家数；输出各国关键项目
 
-Author: Data Science Team
-Version: 2.0 (O-Winner Track)
+运行：
+python mcm_medal_model.py
+
+输出：
+./outputs/
+  - cv_metrics.json
+  - la2028_predictions.csv
+  - la2028_top_improve.csv
+  - la2028_top_decline.csv
+  - first_medal_countries_2028.csv
+  - sport_importance_top5_by_country.csv
 """
 
 import os
-import sys
 import re
 import json
 import math
-import warnings
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from pathlib import Path
 
 from sklearn.preprocessing import StandardScaler
-from scipy import stats
 import statsmodels.api as sm
-from statsmodels.stats.diagnostic import het_breuschpagan, het_white
-from statsmodels.stats.outliers_influence import OLSInfluence
 
-warnings.filterwarnings('ignore')
 
 # =========================
-# 配置与路径管理
+# 配置区
 # =========================
-PROJECT_ROOT = Path(__file__).parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
+DATA_DIR = "/mnt/data"
+ATHLETES_PATH = os.path.join(DATA_DIR, "summerOly_athletes.csv")
+HOSTS_PATH    = os.path.join(DATA_DIR, "summerOly_hosts.csv")
+PROGRAMS_PATH = os.path.join(DATA_DIR, "summerOly_programs.csv")
 
-from src.config import (
-    ATHLETES_FILE, HOSTS_FILE, MEDALS_FILE, PROGRAMS_FILE,
-    OUTPUT_DATA_DIR, FIGURES_DIR, TABLES_DIR
-)
-
-# 数据路径（兼容 config.py 的 Path 对象）
-ATHLETES_PATH = str(ATHLETES_FILE)
-HOSTS_PATH = str(HOSTS_FILE)
-PROGRAMS_PATH = str(PROGRAMS_FILE)
-
-OUT_DIR = str(TABLES_DIR)
-FIG_DIR = str(FIGURES_DIR)
+OUT_DIR = "./outputs"
 os.makedirs(OUT_DIR, exist_ok=True)
-os.makedirs(FIG_DIR, exist_ok=True)
 
 RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 
-# Training configuration
+# 训练只用到 2024（预测 2028）
 TRAIN_END_YEAR = 2024
 PRED_YEAR = 2028
+
+# 选择进入“项目结构”的 sport 数量（太多会高维且稀疏）
 TOP_SPORTS_K = 15
-PI_LEVELS = [(0.10, 0.90), (0.025, 0.975)]  # 80% and 95%
+
+# 预测区间：给 80% 和 95%
+PI_LEVELS = [(0.10, 0.90), (0.025, 0.975)]  # (low, high)
+
+# 模拟次数（越大区间越稳定，但会更慢）
 N_SIM = 5000
-
-# 模型类型选择
-MODEL_TYPE = "nb"  # 'poisson', 'nb', 'zip'
-
-print(f"[CONFIG] Project Root: {PROJECT_ROOT}")
-print(f"[CONFIG] Data Dir: {OUTPUT_DATA_DIR}")
-print(f"[CONFIG] Model Type: {MODEL_TYPE.upper()}")
 
 
 # =========================
@@ -109,32 +104,11 @@ def olympic_years_from_athletes(df_ath: pd.DataFrame):
 # 1) 读数据
 # =========================
 def load_data():
-    """Load all datasets with proper encoding handling."""
-    print("[DATA] Loading datasets...")
-    
-    # Load athletes (largest file)
-    try:
-        athletes = pd.read_csv(ATHLETES_PATH)
-        print(f"  ✓ Athletes: {athletes.shape}")
-    except Exception as e:
-        print(f"  ✗ Error loading athletes: {e}")
-        raise
-    
-    # Load hosts and programs with encoding fallback
-    try:
-        hosts = pd.read_csv(HOSTS_PATH)
-        print(f"  ✓ Hosts: {hosts.shape}")
-    except UnicodeDecodeError:
-        hosts = pd.read_csv(HOSTS_PATH, encoding='latin1')
-        print(f"  ✓ Hosts (latin1): {hosts.shape}")
-    
-    try:
-        programs = pd.read_csv(PROGRAMS_PATH)
-        print(f"  ✓ Programs: {programs.shape}")
-    except UnicodeDecodeError:
-        programs = pd.read_csv(PROGRAMS_PATH, encoding='latin1')
-        print(f"  ✓ Programs (latin1): {programs.shape}")
-    
+    # athletes 很大，但可直接读；如你内存紧张可加 usecols / chunksize
+    athletes = pd.read_csv(ATHLETES_PATH)
+    hosts = pd.read_csv(HOSTS_PATH)
+    # programs 可能不是 utf-8（题目数据经常带特殊字符）
+    programs = pd.read_csv(PROGRAMS_PATH, encoding="latin1")
     return athletes, hosts, programs
 
 
@@ -450,14 +424,7 @@ def fit_nb_model(df: pd.DataFrame, y_col: str, x_cols: list):
     y = df[y_col].astype(float).values
 
     model = sm.NegativeBinomial(y, X)
-    try:
-        res = model.fit(disp=False, maxiter=200)
-    except Exception as e:
-        # Fallback to regularized fit if Hessian is singular or optimization fails
-        try:
-            res = model.fit_regularized(method="l1", alpha=1e-6, disp=False)
-        except Exception:
-            raise e
+    res = model.fit(disp=False, maxiter=200)
 
     return res
 
@@ -477,140 +444,10 @@ def prepare_design(df: pd.DataFrame, x_cols: list, scaler: StandardScaler = None
     return Xs, scaler
 
 
-def filter_columns_for_fit(df: pd.DataFrame, x_cols: list) -> list:
-    """Drop constant or duplicate columns to reduce singularity risk."""
-    cols = [c for c in x_cols if c in df.columns]
-    if not cols:
-        return cols
-    sub = df[cols]
-    nunique = sub.nunique(dropna=False)
-    cols = [c for c in cols if nunique[c] > 1]
-    if len(cols) > 1:
-        dup = sub[cols].T.duplicated()
-        cols = [c for c, d in zip(cols, dup) if not d]
-    return cols
-
-
-def get_beta_and_cov_for_exog(res, Xp: pd.DataFrame):
-    """Align params/cov with design matrix columns (exclude alpha/lnalpha)."""
-    params = res.params
-    cov = res.cov_params()
-    if hasattr(params, "index") and hasattr(cov, "loc"):
-        keep = [c for c in Xp.columns if c in params.index]
-        if keep:
-            beta_mean = params.loc[keep].values
-            cov_use = cov.loc[keep, keep].values
-            return beta_mean, cov_use
-    # Fallback to positional slice
-    k = Xp.shape[1]
-    beta_mean = np.asarray(params)[:k]
-    cov_use = np.asarray(cov)[:k, :k]
-    return beta_mean, cov_use
-
-
 # =========================
-# 8) 模型诊断与评估
+# 8) Time-based CV 评估
 # =========================
-def model_diagnostics(res, X, y, model_name: str):
-    """
-    全面的模型诊断：
-    - 残差分析
-    - 离群点检测
-    - 异方差性检验
-    - 拟合优度
-    """
-    diag = {
-        "model_name": model_name,
-        "n_obs": len(y),
-        "n_features": X.shape[1],
-        "aic": res.aic,
-        "bic": res.bic,
-        "llf": res.llf,
-    }
-    
-    # 预测值
-    mu = res.predict(X)
-    residuals = y - mu
-    std_residuals = residuals / np.sqrt(np.maximum(mu, 1e-6))  # Pearson residuals
-    
-    diag["mean_abs_residual"] = float(np.mean(np.abs(residuals)))
-    diag["rmse"] = float(np.sqrt(np.mean(residuals**2)))
-    diag["pearson_chi2"] = float(np.sum(std_residuals**2))
-    
-    # 离群点（Studentized residuals > 3）
-    try:
-        infl = OLSInfluence(sm.OLS(residuals, X).fit())
-        studentized = infl.resid_studentized_internal
-        outliers = np.where(np.abs(studentized) > 3)[0]
-        diag["n_outliers"] = len(outliers)
-    except Exception:
-        diag["n_outliers"] = None
-    
-    return diag
-
-
-# =========================
-# 9) 模型对比（Poisson vs NB vs ZIP）
-# =========================
-def fit_and_compare_models(df: pd.DataFrame, y_col: str, x_cols: list) -> dict:
-    """
-    拟合多个模型，返回性能对比。
-    """
-    X = sm.add_constant(df[x_cols].astype(float), has_constant="add")
-    y = df[y_col].astype(float).values
-    
-    results = {}
-    
-    # Poisson
-    try:
-        m_poisson = sm.Poisson(y, X).fit(disp=False)
-        results["poisson"] = {
-            "model": m_poisson,
-            "aic": m_poisson.aic,
-            "bic": m_poisson.bic,
-            "status": "OK"
-        }
-    except Exception as e:
-        results["poisson"] = {"status": f"FAILED: {str(e)[:50]}"}
-    
-    # Negative Binomial
-    try:
-        m_nb = sm.NegativeBinomial(y, X).fit(disp=False, maxiter=200)
-        results["nb"] = {
-            "model": m_nb,
-            "aic": m_nb.aic,
-            "bic": m_nb.bic,
-            "status": "OK"
-        }
-    except Exception as e:
-        results["nb"] = {"status": f"FAILED: {str(e)[:50]}"}
-    
-    # Zero-Inflated Poisson (简化版：仅当有大量 0 时尝试)
-    zero_frac = (y == 0).mean()
-    if zero_frac > 0.3:
-        try:
-            from statsmodels.discrete.zero_inflated import ZeroInflatedPoisson
-            m_zip = ZeroInflatedPoisson(y, X).fit(disp=False, maxiter=200)
-            results["zip"] = {
-                "model": m_zip,
-                "aic": m_zip.aic,
-                "bic": m_zip.bic,
-                "status": "OK"
-            }
-        except Exception as e:
-            results["zip"] = {"status": f"FAILED: {str(e)[:50]}"}
-    
-    return results
-
-
-# =========================
-# 9) 时间序列交叉验证
-# =========================
-def time_based_cv(df: pd.DataFrame, y_col: str, x_cols: list, test_years: list) -> dict:
-    """
-    Time-based CV with expanding training window and year-based test splits.
-    Returns point-metric averages and PI coverage summaries.
-    """
+def time_based_cv(df: pd.DataFrame, y_col: str, x_cols: list, test_years: list):
     metrics = []
     cover = {str(l): [] for l in PI_LEVELS}
 
@@ -620,24 +457,20 @@ def time_based_cv(df: pd.DataFrame, y_col: str, x_cols: list, test_years: list) 
         if len(test) == 0 or len(train) == 0:
             continue
 
-        x_use = filter_columns_for_fit(train, x_cols)
-        if len(x_use) == 0:
-            continue
-
-        X_train_s, scaler = prepare_design(train, x_use, scaler=None, fit_scaler=True)
-        X_test_s, _ = prepare_design(test, x_use, scaler=scaler, fit_scaler=False)
+        X_train_s, scaler = prepare_design(train, x_cols, scaler=None, fit_scaler=True)
+        X_test_s, _ = prepare_design(test, x_cols, scaler=scaler, fit_scaler=False)
 
         # 拟合 NB：用标准化后的 X
         train2 = train.copy()
         test2 = test.copy()
-        for c in x_use:
+        for c in x_cols:
             train2[c] = X_train_s[c]
             test2[c]  = X_test_s[c]
 
-        res = fit_nb_model(train2, y_col=y_col, x_cols=x_use)
+        res = fit_nb_model(train2, y_col=y_col, x_cols=x_cols)
 
         # 点预测
-        Xp = sm.add_constant(test2[x_use], has_constant="add")
+        Xp = sm.add_constant(test2[x_cols], has_constant="add")
         mu = res.predict(Xp)
 
         y_true = test2[y_col].values
@@ -653,8 +486,10 @@ def time_based_cv(df: pd.DataFrame, y_col: str, x_cols: list, test_years: list) 
             except Exception:
                 alpha = 0.2  # 兜底
 
+        cov = res.cov_params()
+
         # 系数抽样：多元正态（参数不确定性）
-        beta_mean, cov = get_beta_and_cov_for_exog(res, Xp)
+        beta_mean = res.params.values
         n_draw = 1200
         beta_draw = np.random.multivariate_normal(beta_mean, cov, size=n_draw)
 
@@ -756,38 +591,34 @@ def fit_and_predict_2028(full_df: pd.DataFrame, top_sports: list):
         pred[f"int_total__{s}"] = pred.get(f"strength_total__{s}", 0.0) * pred[s]
         pred[f"int_gold__{s}"]  = pred.get(f"strength_gold__{s}",  0.0) * pred[s]
 
-    # 过滤常量/重复列，降低奇异矩阵风险
-    x_total_use = filter_columns_for_fit(train, x_total)
-    x_gold_use  = filter_columns_for_fit(train, x_gold)
-
     # 标准化（分别对 total/gold 的 X）
-    X_train_total_s, scaler_total = prepare_design(train, x_total_use, scaler=None, fit_scaler=True)
-    X_train_gold_s,  scaler_gold  = prepare_design(train, x_gold_use,  scaler=None, fit_scaler=True)
+    X_train_total_s, scaler_total = prepare_design(train, x_total, scaler=None, fit_scaler=True)
+    X_train_gold_s,  scaler_gold  = prepare_design(train, x_gold,  scaler=None, fit_scaler=True)
 
     train_total = train.copy()
     train_gold  = train.copy()
-    for c in x_total_use:
+    for c in x_total:
         train_total[c] = X_train_total_s[c]
-    for c in x_gold_use:
+    for c in x_gold:
         train_gold[c] = X_train_gold_s[c]
 
     # 拟合两个 NB
-    res_total = fit_nb_model(train_total, y_col="total_medals", x_cols=x_total_use)
-    res_gold  = fit_nb_model(train_gold,  y_col="gold_medals",  x_cols=x_gold_use)
+    res_total = fit_nb_model(train_total, y_col="total_medals", x_cols=x_total)
+    res_gold  = fit_nb_model(train_gold,  y_col="gold_medals",  x_cols=x_gold)
 
     # 预测集标准化
-    X_pred_total_s, _ = prepare_design(pred, x_total_use, scaler=scaler_total, fit_scaler=False)
-    X_pred_gold_s,  _ = prepare_design(pred, x_gold_use,  scaler=scaler_gold,  fit_scaler=False)
+    X_pred_total_s, _ = prepare_design(pred, x_total, scaler=scaler_total, fit_scaler=False)
+    X_pred_gold_s,  _ = prepare_design(pred, x_gold,  scaler=scaler_gold,  fit_scaler=False)
 
     pred_total = pred.copy()
     pred_gold  = pred.copy()
-    for c in x_total_use:
+    for c in x_total:
         pred_total[c] = X_pred_total_s[c]
-    for c in x_gold_use:
+    for c in x_gold:
         pred_gold[c] = X_pred_gold_s[c]
 
-    Xp_total = sm.add_constant(pred_total[x_total_use], has_constant="add")
-    Xp_gold  = sm.add_constant(pred_gold[x_gold_use],  has_constant="add")
+    Xp_total = sm.add_constant(pred_total[x_total], has_constant="add")
+    Xp_gold  = sm.add_constant(pred_gold[x_gold],  has_constant="add")
 
     mu_total = res_total.predict(Xp_total)
     mu_gold  = res_gold.predict(Xp_gold)
@@ -800,7 +631,8 @@ def fit_and_predict_2028(full_df: pd.DataFrame, top_sports: list):
         except Exception:
             alpha = float(res.params["alpha"]) if "alpha" in res.params.index else 0.2
 
-        beta_mean, cov = get_beta_and_cov_for_exog(res, Xp)
+        cov = res.cov_params()
+        beta_mean = res.params.values
         beta_draw = np.random.multivariate_normal(beta_mean, cov, size=N_SIM)  # (N_SIM, p)
 
         Xmat = Xp.values  # (n, p)
@@ -853,7 +685,7 @@ def fit_and_predict_2028(full_df: pd.DataFrame, top_sports: list):
         "noc_order": out["NOC"].tolist()
     }
 
-    return out, sim_store, res_total, res_gold, x_total_use, x_gold_use
+    return out, sim_store, res_total, res_gold, x_total, x_gold
 
 
 # =========================
