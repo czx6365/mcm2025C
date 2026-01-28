@@ -12,13 +12,21 @@ PROJECT_ROOT = Path(__file__).parent.parent
 # 数据目录
 DATA_RAW_DIR = PROJECT_ROOT / "data" / "raw" / "2025_Problem_C_Data"
 DATA_PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
+DATA_CLEAN_DIR = DATA_PROCESSED_DIR / "clean"
 
-# 数据文件路径
-ATHLETES_FILE = DATA_RAW_DIR / "summerOly_athletes.csv"
-HOSTS_FILE = DATA_RAW_DIR / "summerOly_hosts.csv"
-MEDALS_FILE = DATA_RAW_DIR / "summerOly_medal_counts.csv"
-PROGRAMS_FILE = DATA_RAW_DIR / "summerOly_programs.csv"
-DATA_DICT_FILE = DATA_RAW_DIR / "data_dictionary.csv"
+# 数据文件路径（默认优先使用 clean）
+ATHLETES_FILE = DATA_CLEAN_DIR / "summerOly_athletes_clean.csv"
+HOSTS_FILE = DATA_CLEAN_DIR / "summerOly_hosts_clean.csv"
+MEDALS_FILE = DATA_CLEAN_DIR / "summerOly_medal_counts_clean.csv"
+PROGRAMS_FILE = DATA_CLEAN_DIR / "summerOly_programs_clean.csv"
+DATA_DICT_FILE = DATA_CLEAN_DIR / "data_dictionary.csv"
+
+# raw 回退路径（需要时可在脚本中使用）
+ATHLETES_FILE_RAW = DATA_RAW_DIR / "summerOly_athletes.csv"
+HOSTS_FILE_RAW = DATA_RAW_DIR / "summerOly_hosts.csv"
+MEDALS_FILE_RAW = DATA_RAW_DIR / "summerOly_medal_counts.csv"
+PROGRAMS_FILE_RAW = DATA_RAW_DIR / "summerOly_programs.csv"
+DATA_DICT_FILE_RAW = DATA_RAW_DIR / "data_dictionary.csv"
 
 # 输出目录
 OUTPUT_DIR = PROJECT_ROOT / "outputs"

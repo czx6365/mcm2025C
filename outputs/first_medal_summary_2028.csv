@@ -1,0 +1,9 @@
+Year,n_never_medaled_in_pred_set,expected_new_medal_countries,rounded_estimate,odds_exact_count,odds_within_plusminus_1,count_p10,count_p90,count_p2_5,count_p97_5
+2028,67,8.3544,8,0.1412,0.4258,5.0,12.0,4.0,14.0
+
+
+
+Among 67 countries that have never won an Olympic medal, our model predicts that approximately 
+8 countries will break through in the 2028 Los Angeles Olympics.
+The central 80% prediction interval ranges from 5 to 12, 
+indicating moderate uncertainty but a stable central tendency.

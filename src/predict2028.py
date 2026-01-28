@@ -278,7 +278,7 @@ def build_table(athletes, medal_counts, hosts, programs):
     host_map = build_host_map(hosts, athletes)
     table["host_noc"] = table["Year"].map(host_map).fillna("")
     table["host_boost"] = (table["NOC"] == table["host_noc"]).astype(float)
-    table["host_boost"] *= 0.1
+    table["host_boost"] *= 0.05
 
 
     # 4) events
@@ -315,7 +315,7 @@ def build_table(athletes, medal_counts, hosts, programs):
 # 不确定性模拟（PI）
 # ========================
 
-def simulate_pi(res, Xp, n_sim=N_SIM):
+def simulate_pi(res, Xp, n_sim=N_SIM, return_draws=False):
     """
     - beta 参数不确定性：多元正态抽样
     - NB 计数不确定性：negative_binomial 抽样
@@ -347,7 +347,78 @@ def simulate_pi(res, Xp, n_sim=N_SIM):
             np.quantile(y_sim, lo, axis=0),
             np.quantile(y_sim, hi, axis=0),
         )
+    if return_draws:
+        out["y_sim"] = y_sim
     return out
+
+
+def project_first_medals(latest, table, sim_total, out_dir, year):
+    """
+    Estimate how many never-medaled NOCs win their first medal in the target year.
+    Uses posterior predictive draws from the total medals model.
+    """
+    hist = table.groupby("NOC")["total_medals"].sum()
+    never_medaled = set(hist[hist == 0].index)
+    mask = latest["NOC"].isin(never_medaled)
+
+    if mask.sum() == 0:
+        print("[WARN] No never-medaled NOCs found in the prediction set.")
+        return
+
+    y_sim = sim_total.get("y_sim")
+    if y_sim is None:
+        raise ValueError("sim_total must include 'y_sim' draws (use return_draws=True).")
+
+    y_sim_never = y_sim[:, mask.values]
+    prob_first = (y_sim_never >= 1).mean(axis=0)
+    count_sim = (y_sim_never >= 1).sum(axis=1)
+
+    expected = float(prob_first.sum())
+    rounded = int(np.round(expected))
+    odds_exact = float(np.mean(count_sim == rounded))
+    odds_pm1 = float(np.mean(np.abs(count_sim - rounded) <= 1))
+
+    q10, q90 = np.quantile(count_sim, [0.10, 0.90])
+    q025, q975 = np.quantile(count_sim, [0.025, 0.975])
+
+    # Per-NOC probabilities
+    probs = latest.loc[mask, ["NOC"]].copy()
+    probs["prob_first_medal"] = prob_first
+    probs["pred_total_mu"] = sim_total["mu_point"][mask.values]
+    probs = probs.sort_values("prob_first_medal", ascending=False).reset_index(drop=True)
+
+    probs_path = out_dir / f"first_medal_probs_{year}.csv"
+    probs.to_csv(probs_path, index=False)
+
+    summary = pd.DataFrame([{
+        "Year": year,
+        "n_never_medaled_in_pred_set": int(mask.sum()),
+        "expected_new_medal_countries": expected,
+        "rounded_estimate": rounded,
+        "odds_exact_count": odds_exact,
+        "odds_within_plusminus_1": odds_pm1,
+        "count_p10": float(q10),
+        "count_p90": float(q90),
+        "count_p2_5": float(q025),
+        "count_p97_5": float(q975),
+    }])
+    summary_path = out_dir / f"first_medal_summary_{year}.csv"
+    summary.to_csv(summary_path, index=False)
+
+    print("First-medal projection:")
+    print(
+        f"  Expected new medal countries: {expected:.2f} "
+        f"(rounded: {rounded})"
+    )
+    print(
+        f"  Odds exact={odds_exact:.2%}, within +/-1={odds_pm1:.2%}"
+    )
+    print(
+        f"  80% interval: [{q10:.0f}, {q90:.0f}], "
+        f"95% interval: [{q025:.0f}, {q975:.0f}]"
+    )
+    print("  Saved:", probs_path)
+    print("  Saved:", summary_path)
 
 
 # ========================
@@ -417,6 +488,10 @@ def main():
 
     # 设定预测年份与主办国
     latest["Year"] = PRED_YEAR
+    # 2028 的 host_boost 在 latest 取出后需重算，否则仍是基准年的值
+    host_map = build_host_map(hosts, athletes)
+    host_noc_2028 = host_map.get(PRED_YEAR, "USA") or "USA"
+    latest["host_boost"] = (latest["NOC"] == host_noc_2028).astype(float) * 0.02
     # 显式设定 2028 的 log_events：默认用基准年近似（论文写：use latest known as proxy）
     logev_base = table.loc[table["Year"] == base_year, "log_events"].iloc[0]
     latest["log_events"] = float(logev_base)
@@ -424,7 +499,7 @@ def main():
     # ===== 预测：Total =====
     Xp_t_std, _ = prepare_design(latest, x_cols_total, scaler=scaler_t, fit=False)
     Xp_t = sm.add_constant(Xp_t_std, has_constant="add")
-    sim_total = simulate_pi(res_total, Xp_t)
+    sim_total = simulate_pi(res_total, Xp_t, return_draws=True)
 
     # ===== 预测：Gold =====
     Xp_g_std, _ = prepare_design(latest, x_cols_gold, scaler=scaler_g, fit=False)
@@ -445,6 +520,32 @@ def main():
         out[f"gold_{int(lo*100)}_{int(hi*100)}_lo"] = sim_gold[(lo, hi)][0]
         out[f"gold_{int(lo*100)}_{int(hi*100)}_hi"] = sim_gold[(lo, hi)][1]
 
+    # ========================
+    # Medal budget scaling（配额缩放：让总奖牌/总金牌不“超发”）
+    # ========================
+    medals_2024 = medal_counts[medal_counts["Year"] == 2024].copy()
+    if medals_2024.empty:
+        medals_2024 = medal_counts[medal_counts["Year"] == base_year].copy()
+    budget_total = pd.to_numeric(medals_2024["Total"], errors="coerce").fillna(0).sum()
+    budget_gold = pd.to_numeric(medals_2024["Gold"], errors="coerce").fillna(0).sum()
+
+    sum_total_pred = out["total_pred"].sum()
+    sum_gold_pred = out["gold_pred"].sum()
+    k_total = (budget_total / sum_total_pred) if sum_total_pred > 0 else 1.0
+    k_gold = (budget_gold / sum_gold_pred) if sum_gold_pred > 0 else 1.0
+
+    out["total_pred"] *= k_total
+    out["gold_pred"] *= k_gold
+    for lo, hi in PI_LEVELS:
+        out[f"total_{int(lo*100)}_{int(hi*100)}_lo"] *= k_total
+        out[f"total_{int(lo*100)}_{int(hi*100)}_hi"] *= k_total
+        out[f"gold_{int(lo*100)}_{int(hi*100)}_lo"] *= k_gold
+        out[f"gold_{int(lo*100)}_{int(hi*100)}_hi"] *= k_gold
+
+    for c in out.columns:
+        if c.startswith("total_") or c.startswith("gold_") or c in ["total_pred", "gold_pred"]:
+            out[c] = out[c].clip(lower=0.0)
+
     out = out.sort_values(["gold_pred", "total_pred"], ascending=False).reset_index(drop=True)
 
     out_path = OUT_DIR / "la2028_predictions.csv"
@@ -453,6 +554,9 @@ def main():
     print(f"Baseline year used: {base_year} -> Pred year: {PRED_YEAR}")
     print("Top 10 preview:")
     print(out.head(10).to_string(index=False))
+
+    # ===== First medal projection for never-medaled NOCs =====
+    project_first_medals(latest, table, sim_total, OUT_DIR, PRED_YEAR)
 
 
 if __name__ == "__main__":
